@@ -43,6 +43,19 @@ from .baseline import GeneformerISPOptimizer
 from .profiler import PerformanceProfiler
 from ..evaluation.evaluator import EmbeddingEvaluator
 
+# Import distributed utilities
+try:
+    from .distributed import (
+        get_world_size, get_rank, is_main_process, split_data_for_rank
+    )
+    DDP_AVAILABLE = True
+except ImportError:
+    DDP_AVAILABLE = False
+    def get_world_size(): return 1
+    def get_rank(): return 0
+    def is_main_process(): return True
+    def split_data_for_rank(data, world_size, rank): return data
+
 # Optional imports for ONNX and TensorRT
 try:
     import onnx
@@ -72,7 +85,8 @@ class OptimizedGeneformerISPOptimizer(GeneformerISPOptimizer):
     def __init__(self, model_name: str = "gf-6L-10M-i2048", device: str = "cuda",
                  use_wandb: bool = False, wandb_project: str = "ispo-optimized",
                  wandb_run_name: Optional[str] = None, wandb_config: Optional[Dict] = None,
-                 baseline_embeddings_path: Optional[str] = None, num_gpus: Optional[int] = None):
+                 baseline_embeddings_path: Optional[str] = None, num_gpus: Optional[int] = None,
+                 use_ddp: bool = False):
         """
         Initialize optimized optimizer.
         
@@ -85,8 +99,9 @@ class OptimizedGeneformerISPOptimizer(GeneformerISPOptimizer):
             wandb_config: Optional config dictionary for wandb
             baseline_embeddings_path: Optional path to baseline embeddings for comparison
             num_gpus: Number of GPUs to use for multi-GPU inference (None = use all available)
+            use_ddp: Whether to use Distributed Data Parallel (DDP) instead of DataParallel
         """
-        super().__init__(model_name, device, use_wandb, wandb_project, wandb_run_name, wandb_config, num_gpus)
+        super().__init__(model_name, device, use_wandb, wandb_project, wandb_run_name, wandb_config, num_gpus, use_ddp)
         self.baseline_embeddings_path = baseline_embeddings_path
         self.baseline_embeddings = None
         self.embedding_evaluator = EmbeddingEvaluator()
@@ -192,38 +207,84 @@ class OptimizedGeneformerISPOptimizer(GeneformerISPOptimizer):
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Scale batch size for multi-GPU (DataParallel splits batches automatically)
-        effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
-        logger.info(f"Starting batching optimized inference with batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size}")
-        self.profiler.start_profiling()
+        # Handle multi-GPU setup
+        if self.use_ddp:
+            # DDP: each process handles a subset of data
+            world_size = get_world_size()
+            rank = get_rank()
+            if is_main_process():
+                logger.info(f"Starting DDP batching inference (rank={rank}, world_size={world_size}, batch_size={batch_size})")
+            effective_batch_size = batch_size  # DDP: each process uses base batch size
+        else:
+            # DataParallel: scale batch size (splits automatically)
+            effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
+            if is_main_process() or not self.use_ddp:
+                logger.info(f"Starting batching optimized inference with batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size}")
+        
+        # Only start profiling on main process (or if not using DDP)
+        if is_main_process() or not self.use_ddp:
+            self.profiler.start_profiling()
 
         # Process data
-        logger.info("Processing data...")
+        if is_main_process() or not self.use_ddp:
+            logger.info("Processing data...")
         dataset = self.model.process_data(adata)
 
+        # Split data for DDP
+        if self.use_ddp:
+            dataset = split_data_for_rank(dataset, get_world_size(), get_rank())
+            if is_main_process():
+                logger.info(f"DDP: Rank {get_rank()} processing {len(dataset)} samples")
+
         # Run inference with larger batches
-        logger.info("Running inference with optimized batching...")
+        if is_main_process() or not self.use_ddp:
+            logger.info("Running inference with optimized batching...")
         all_embeddings = []
 
-        # Use effective batch size for processing (DataParallel will split across GPUs)
+        # Use effective batch size for processing
         for i in range(0, len(dataset), effective_batch_size):
             batch_end = min(i + batch_size, len(dataset))
-            batch_dataset = dataset.select(range(i, batch_end))
+            batch_dataset = dataset.select(range(i, batch_end)) if hasattr(dataset, 'select') else dataset[i:batch_end]
 
-            # Update profiling metrics
-            self.profiler.update_metrics()
+            # Update profiling metrics (only on main process or if not using DDP)
+            if is_main_process() or not self.use_ddp:
+                self.profiler.update_metrics()
 
             # Run inference on batch
             batch_embeddings = self.model.get_embeddings(batch_dataset)
             all_embeddings.append(batch_embeddings)
 
-            logger.info(f"Processed batch {i//effective_batch_size + 1}/{(len(dataset)-1)//effective_batch_size + 1} (size: {batch_end-i})")
+            if is_main_process() or not self.use_ddp:
+                logger.info(f"Processed batch {i//effective_batch_size + 1}/{(len(dataset)-1)//effective_batch_size + 1} (size: {batch_end-i})")
 
-        # Combine all embeddings
-        embeddings = np.vstack(all_embeddings)
+        # Gather embeddings from all DDP processes
+        if self.use_ddp and get_world_size() > 1:
+            import torch.distributed as dist
+            all_embeddings_list = [None] * get_world_size()
+            dist.all_gather_object(all_embeddings_list, all_embeddings)
+            
+            # Flatten and combine embeddings from all processes
+            if is_main_process():
+                all_embeddings = []
+                for rank_embeddings in all_embeddings_list:
+                    all_embeddings.extend(rank_embeddings)
+            else:
+                all_embeddings = []
 
-        # Stop profiling
-        performance_metrics = self.profiler.stop_profiling()
+        # Combine all embeddings (only on main process for DDP)
+        if self.use_ddp:
+            if is_main_process():
+                embeddings = np.vstack(all_embeddings) if all_embeddings else np.array([])
+            else:
+                embeddings = np.array([])
+        else:
+            embeddings = np.vstack(all_embeddings)
+
+        # Stop profiling (only on main process or if not using DDP)
+        if is_main_process() or not self.use_ddp:
+            performance_metrics = self.profiler.stop_profiling()
+        else:
+            performance_metrics = {'total_time_seconds': 0}
 
         # Evaluate embeddings using zero-shot classification and geometry metrics
         perturbation_labels = None

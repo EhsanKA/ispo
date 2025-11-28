@@ -146,6 +146,21 @@ python -m ispo optimized --method mixed_precision --num_perturbations 1000
 
 # Run with Weights & Biases tracking
 python -m ispo baseline --use_wandb --wandb_project ispo-baseline --num_perturbations 1000
+
+# Run with Distributed Data Parallel (DDP) on multiple GPUs
+# Example: Run on 4 GPUs with batching optimization
+torchrun --nproc_per_node=4 -m ispo.scripts.run_ddp \
+    --method batching \
+    --batch_size 256 \
+    --num_perturbations 1000 \
+    --model_name gf-6L-10M-i2048
+
+# Example: Run on 2 GPUs with mixed precision
+torchrun --nproc_per_node=2 -m ispo.scripts.run_ddp \
+    --method mixed_precision \
+    --batch_size 128 \
+    --precision fp16 \
+    --num_perturbations 1000
 ```
 
 ### Programmatic Usage
@@ -235,6 +250,39 @@ with torch.cuda.amp.autocast():
 - Model weights (~40-150 MB) are <5% of total memory; quantizing them would save <100 MB, which is negligible compared to data loading, activations, and Python overhead
 
 **Results**: 11.0x speedup (74.05s → 6.71s for 1000 samples) - Note: This is effectively FP16 mixed precision on CUDA
+
+### 4. Distributed Data Parallel (DDP)
+
+**Strategy**: Use PyTorch DDP for true multi-GPU parallelism with better efficiency than DataParallel
+
+**Benefits**:
+- **Multiprocessing**: Avoids Python GIL limitations (DataParallel uses multithreading)
+- **Better Scalability**: More efficient communication between GPUs
+- **Lower Overhead**: Reduced synchronization costs
+- **Linear Scaling**: Near-linear speedup with number of GPUs
+
+**Usage**:
+```bash
+# Launch with torchrun (recommended)
+torchrun --nproc_per_node=4 -m ispo.scripts.run_ddp \
+    --method batching \
+    --batch_size 256 \
+    --num_perturbations 1000
+
+# Or programmatically
+optimizer = OptimizedGeneformerISPOptimizer(use_ddp=True)
+```
+
+**Implementation Details**:
+- Each GPU process handles a subset of the data
+- Embeddings are gathered from all processes at the end
+- Only rank 0 (main process) saves results and logs metrics
+- Automatic data splitting across processes
+
+**When to Use**:
+- **DDP**: Best for multi-GPU setups (2+ GPUs), better performance and scalability
+- **DataParallel**: Simpler for single-node multi-GPU, but less efficient
+- **Single GPU**: Use neither (default behavior)
 
 ## 📈 Evaluation Methodology
 
@@ -384,10 +432,30 @@ results = optimizer.run_mixed_precision_inference(
 - **Model Size**: Larger Geneformer models may require different strategies
 - **Quantization Support**: Current Helical version lacks quantization
 
+### Multi-GPU Support
+
+The codebase supports two multi-GPU strategies:
+
+1. **DataParallel** (default): Simple multi-GPU support using PyTorch's DataParallel
+   - Automatically enabled when `num_gpus > 1`
+   - Works out of the box, no special launch required
+   - Good for quick multi-GPU experiments
+
+2. **Distributed Data Parallel (DDP)**: More efficient multi-GPU support ✅ **NEW**
+   - Enabled with `use_ddp=True` and launched via `torchrun`
+   - Better performance and scalability
+   - Recommended for production multi-GPU inference
+
+**Example DDP Usage**:
+```bash
+# Run on 4 GPUs
+torchrun --nproc_per_node=4 -m ispo.scripts.run_ddp \
+    --method batching --batch_size 256 --num_perturbations 1000
+```
+
 ### Future Optimizations
 
-- **Multi-GPU Scaling**: Distributed inference across multiple GPUs
 - **Model Parallelism**: Split large models across devices
-- **Advanced Quantization**: Implement custom quantization pipelines
+- **Advanced Quantization**: Implement custom quantization pipelines (CUDA-compatible)
 - **TensorRT Integration**: Further optimization for NVIDIA GPUs
 - **CPU Optimization**: SIMD instructions and threading

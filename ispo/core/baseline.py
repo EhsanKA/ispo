@@ -23,6 +23,17 @@ from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings("ignore")
 
+# Import distributed utilities
+try:
+    from .distributed import (
+        setup_ddp, cleanup_ddp, is_ddp_available, get_world_size, get_rank,
+        is_main_process, wrap_model_with_ddp, split_data_for_rank
+    )
+    DDP_AVAILABLE = True
+except ImportError:
+    DDP_AVAILABLE = False
+    logger.warning("DDP utilities not available")
+
 # Configure logging first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -68,7 +79,7 @@ class GeneformerISPOptimizer:
     def __init__(self, model_name: str = "gf-6L-10M-i2048", device: str = "cuda",
                  use_wandb: bool = False, wandb_project: str = "ispo-baseline",
                  wandb_run_name: Optional[str] = None, wandb_config: Optional[Dict] = None,
-                 num_gpus: Optional[int] = None):
+                 num_gpus: Optional[int] = None, use_ddp: bool = False):
         """
         Initialize the Geneformer ISP optimizer.
 
@@ -80,31 +91,67 @@ class GeneformerISPOptimizer:
             wandb_run_name: Optional name for the wandb run
             wandb_config: Optional config dictionary for wandb
             num_gpus: Number of GPUs to use for multi-GPU inference (None = use all available, 1 = single GPU)
+            use_ddp: Whether to use Distributed Data Parallel (DDP) instead of DataParallel
         """
         self.model_name = model_name
         self.device = device
         self.model = None
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         self.wandb_run = None
+        self.use_ddp = use_ddp and DDP_AVAILABLE
         
         # Multi-GPU support
         if device == "cuda" and torch.cuda.is_available():
             available_gpus = torch.cuda.device_count()
-            if num_gpus is None:
-                # Use all available GPUs by default
-                self.num_gpus = available_gpus
-            else:
-                # Use specified number, but cap at available
-                self.num_gpus = min(num_gpus, available_gpus)
             
-            if self.num_gpus > 1:
-                logger.info(f"Multi-GPU mode: Using {self.num_gpus} GPUs")
+            # DDP mode: use environment variables set by torchrun
+            if self.use_ddp:
+                if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+                    self.rank = int(os.environ['RANK'])
+                    self.world_size = int(os.environ['WORLD_SIZE'])
+                    self.local_rank = int(os.environ.get('LOCAL_RANK', self.rank))
+                    self.num_gpus = self.world_size
+                    
+                    # Setup DDP
+                    setup_ddp(self.rank, self.world_size)
+                    torch.cuda.set_device(self.local_rank)
+                    self.device = f"cuda:{self.local_rank}"
+                    
+                    logger.info(f"DDP mode: rank={self.rank}, world_size={self.world_size}, local_rank={self.local_rank}")
+                else:
+                    logger.warning("DDP requested but RANK/WORLD_SIZE not set. Falling back to DataParallel.")
+                    self.use_ddp = False
+                    self.rank = 0
+                    self.world_size = 1
+                    self.local_rank = 0
+                    if num_gpus is None:
+                        self.num_gpus = available_gpus
+                    else:
+                        self.num_gpus = min(num_gpus, available_gpus)
+            else:
+                # DataParallel mode
+                self.rank = 0
+                self.world_size = 1
+                self.local_rank = 0
+                if num_gpus is None:
+                    # Use all available GPUs by default
+                    self.num_gpus = available_gpus
+                else:
+                    # Use specified number, but cap at available
+                    self.num_gpus = min(num_gpus, available_gpus)
+            
+            if self.num_gpus > 1 and not self.use_ddp:
+                logger.info(f"Multi-GPU mode (DataParallel): Using {self.num_gpus} GPUs")
                 for i in range(self.num_gpus):
                     logger.info(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-            else:
+            elif self.num_gpus == 1:
                 self.num_gpus = 1
         else:
             self.num_gpus = 1
+            self.rank = 0
+            self.world_size = 1
+            self.local_rank = 0
+            self.use_ddp = False
         
         # Initialize wandb if requested
         if self.use_wandb:
@@ -132,7 +179,9 @@ class GeneformerISPOptimizer:
 
     def load_model(self):
         """Load the Geneformer model."""
-        logger.info(f"Loading Geneformer model: {self.model_name}")
+        if is_main_process() or not self.use_ddp:
+            logger.info(f"Loading Geneformer model: {self.model_name}")
+        
         config = GeneformerConfig(
             model_name=self.model_name,
             device=self.device,
@@ -140,20 +189,37 @@ class GeneformerISPOptimizer:
         )
         self.model = Geneformer(config)
         
-        # Wrap model with DataParallel for multi-GPU support
-        if self.num_gpus > 1 and torch.cuda.device_count() > 1:
-            logger.info(f"Wrapping model with DataParallel for {self.num_gpus} GPUs")
+        # Wrap model with DDP or DataParallel for multi-GPU support
+        if self.use_ddp and self.num_gpus > 1:
+            # DDP mode
+            if hasattr(self.model, 'model'):
+                device = torch.device(self.device)
+                self.model.model = wrap_model_with_ddp(
+                    self.model.model,
+                    device=device,
+                    find_unused_parameters=False
+                )
+                if is_main_process():
+                    logger.info(f"Model wrapped with DDP on {self.num_gpus} GPUs")
+            else:
+                logger.warning("Model does not have 'model' attribute. DDP may not work correctly.")
+        elif self.num_gpus > 1 and torch.cuda.device_count() > 1 and not self.use_ddp:
+            # DataParallel mode (fallback)
+            if is_main_process() or not self.use_ddp:
+                logger.info(f"Wrapping model with DataParallel for {self.num_gpus} GPUs")
             # Access the underlying PyTorch model
             if hasattr(self.model, 'model'):
                 self.model.model = DataParallel(
                     self.model.model,
                     device_ids=list(range(self.num_gpus))
                 )
-                logger.info(f"Model wrapped with DataParallel on GPUs: {list(range(self.num_gpus))}")
+                if is_main_process() or not self.use_ddp:
+                    logger.info(f"Model wrapped with DataParallel on GPUs: {list(range(self.num_gpus))}")
             else:
                 logger.warning("Model does not have 'model' attribute. Multi-GPU may not work correctly.")
         
-        logger.info("Model loaded successfully")
+        if is_main_process() or not self.use_ddp:
+            logger.info("Model loaded successfully")
 
     def load_perturbation_data(self, data_path: str = "SrivatsanTrapnell2020_sciplex2.h5ad",
                               num_cells: int = 1000, dataset: str = "sciplex2") -> anndata.AnnData:
@@ -461,39 +527,91 @@ class GeneformerISPOptimizer:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Scale batch size for multi-GPU (DataParallel splits batches automatically)
-        # With num_gpus GPUs, we can process larger batches efficiently
-        effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
-        logger.info(f"Starting baseline inference with profiling (batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size})")
-        self.profiler.start_profiling()
+        # Handle multi-GPU setup
+        if self.use_ddp:
+            # DDP: each process handles a subset of data
+            world_size = get_world_size()
+            rank = get_rank()
+            if is_main_process():
+                logger.info(f"Starting DDP baseline inference (rank={rank}, world_size={world_size}, batch_size={batch_size})")
+        else:
+            # DataParallel: scale batch size (splits automatically)
+            effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
+            if is_main_process() or not self.use_ddp:
+                logger.info(f"Starting baseline inference with profiling (batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size})")
+        
+        # Only start profiling on main process (or if not using DDP)
+        if is_main_process() or not self.use_ddp:
+            self.profiler.start_profiling()
 
         # Process data
-        logger.info("Processing data...")
+        if is_main_process() or not self.use_ddp:
+            logger.info("Processing data...")
         dataset = self.model.process_data(adata)
 
+        # Split data for DDP
+        if self.use_ddp:
+            dataset = split_data_for_rank(dataset, get_world_size(), get_rank())
+            if is_main_process():
+                logger.info(f"DDP: Rank {get_rank()} processing {len(dataset)} samples")
+
         # Run inference with periodic profiling updates
-        logger.info("Running inference...")
+        if is_main_process() or not self.use_ddp:
+            logger.info("Running inference...")
         all_embeddings = []
 
-        # Use effective batch size for processing (DataParallel will split across GPUs)
+        # Determine batch size for iteration
+        if self.use_ddp:
+            effective_batch_size = batch_size  # DDP: each process uses base batch size
+        else:
+            effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
+
+        # Use effective batch size for processing
         for i in range(0, len(dataset), effective_batch_size):
             batch_end = min(i + effective_batch_size, len(dataset))
-            batch_dataset = dataset.select(range(i, batch_end))
+            batch_dataset = dataset.select(range(i, batch_end)) if hasattr(dataset, 'select') else dataset[i:batch_end]
 
-            # Update profiling metrics
-            self.profiler.update_metrics()
+            # Update profiling metrics (only on main process or if not using DDP)
+            if is_main_process() or not self.use_ddp:
+                self.profiler.update_metrics()
 
             # Run inference on batch
             batch_embeddings = self.model.get_embeddings(batch_dataset)
             all_embeddings.append(batch_embeddings)
 
-            logger.info(f"Processed batch {i//effective_batch_size + 1}/{(len(dataset)-1)//effective_batch_size + 1}")
+            if is_main_process() or not self.use_ddp:
+                logger.info(f"Processed batch {i//effective_batch_size + 1}/{(len(dataset)-1)//effective_batch_size + 1}")
 
-        # Combine all embeddings
-        embeddings = np.vstack(all_embeddings)
+        # Gather embeddings from all DDP processes
+        if self.use_ddp and get_world_size() > 1:
+            # Collect embeddings from all ranks
+            import torch.distributed as dist
+            all_embeddings_list = [None] * get_world_size()
+            dist.all_gather_object(all_embeddings_list, all_embeddings)
+            
+            # Flatten and combine embeddings from all processes
+            if is_main_process():
+                all_embeddings = []
+                for rank_embeddings in all_embeddings_list:
+                    all_embeddings.extend(rank_embeddings)
+            else:
+                # Non-main processes don't need full embeddings
+                all_embeddings = []
 
-        # Stop profiling
-        performance_metrics = self.profiler.stop_profiling()
+        # Combine all embeddings (only on main process for DDP)
+        if self.use_ddp:
+            if is_main_process():
+                embeddings = np.vstack(all_embeddings) if all_embeddings else np.array([])
+            else:
+                embeddings = np.array([])  # Non-main processes don't need embeddings
+        else:
+            embeddings = np.vstack(all_embeddings)
+
+        # Stop profiling (only on main process or if not using DDP)
+        if is_main_process() or not self.use_ddp:
+            performance_metrics = self.profiler.stop_profiling()
+        else:
+            performance_metrics = {'total_time_seconds': 0}  # Placeholder for non-main processes
 
         # Evaluate embeddings using zero-shot classification
         # Get perturbation labels from adata
