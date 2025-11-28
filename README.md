@@ -4,7 +4,7 @@
 
 This repository implements comprehensive optimizations for efficient **In-Silico Perturbation (ISP)** inference using Foundation Models, specifically the **Geneformer** model from the Helical package. The project demonstrates significant performance improvements through multiple optimization techniques while maintaining model accuracy and embedding quality.
 
-**Key Achievement**: Achieved up to **10.9x speedup** in inference throughput while preserving embedding quality and biological accuracy.
+**Key Achievement**: Achieved up to **11.0x speedup** (1003% improvement) in inference throughput for Geneformer v1 while preserving embedding quality and biological accuracy. Geneformer v2 achieved up to **8.16x speedup** (716% improvement).
 
 ## 🎯 Challenge Objectives
 
@@ -53,18 +53,44 @@ ispo/
 
 Based on comprehensive benchmarking with 1000 SciPlex2 perturbations:
 
-| Method | Time (s) | Throughput (samples/s) | Speedup | Improvement |
-|--------|----------|------------------------|---------|-------------|
-| **Baseline** | 74.05 | 13.5 | 1.00x | - |
-| **Batching (bs=256)** | 6.85 | 146.0 | **10.8x** | +981% |
-| **Mixed Precision FP16** | 6.77 | 147.7 | **10.9x** | +994% |
+#### Geneformer v1 (gf-6L-10M-i2048)
+
+| Method | Time (s) | Throughput (samples/s) | Speedup | Improvement | CPU Usage (%) | GPU Usage (%) | Memory (GB) |
+|--------|----------|------------------------|---------|-------------|---------------|---------------|-------------|
+| **Baseline** | 74.05 | 13.5 | 1.00x | - | 3.5 | 2.1 | 3.5 |
+| **Batching (bs=8)** | 16.21 | 61.7 | 4.57x | +357% | 3.6 | 8.3 | 3.5 |
+| **Batching (bs=16)** | 10.29 | 97.2 | 7.20x | +620% | 3.4 | 13.4 | 3.5 |
+| **Batching (bs=64)** | 7.71 | 129.7 | 9.60x | +860% | 3.4 | 20.8 | 3.5 |
+| **Batching (bs=256)** | 6.85 | 146.0 | **10.8x** | +981% | 3.5 | 17.3 | 3.4 |
+| **Batching (bs=512)** | 6.74 | 148.4 | **11.0x** | +999% | 3.7 | 11.0 | 3.3 |
+| **Mixed Precision FP16** | 6.77 | 147.7 | **10.9x** | +994% | 3.4 | 17.3 | 3.4 |
+| **Mixed Precision BF16** | 6.79 | 147.3 | **10.9x** | +991% | 3.4 | 17.5 | 3.4 |
+| **Quantization 8-bit** | 6.71 | 149.0 | **11.0x** | +1003% | 3.7 | 17.0 | 3.5 |
+
+#### Geneformer v2 (gf-12L-38M-i4096)
+
+| Method | Time (s) | Throughput (samples/s) | Speedup | Improvement | CPU Usage (%) | GPU Usage (%) | Memory (GB) |
+|--------|----------|------------------------|---------|-------------|---------------|---------------|-------------|
+| **Baseline** | 81.96 | 12.2 | 1.00x | - | 3.5 | 6.2 | 3.6 |
+| **Batching (bs=8)** | 18.93 | 52.8 | 4.33x | +333% | 3.4 | 23.6 | 3.6 |
+| **Batching (bs=16)** | 13.83 | 72.3 | 5.92x | +492% | 3.4 | 33.1 | 3.6 |
+| **Batching (bs=64)** | 10.94 | 91.4 | 7.49x | +649% | 3.4 | 44.4 | 3.6 |
+| **Batching (bs=256)** | 10.04 | 99.6 | 8.16x | +716% | 3.4 | 36.0 | 3.5 |
+| **Batching (bs=512)** | 10.04 | 99.6 | 8.16x | +716% | 3.7 | 26.0 | 3.4 |
+| **Mixed Precision FP16** | 10.41 | 96.1 | 7.87x | +687% | 3.4 | 27.5 | 3.5 |
+| **Mixed Precision BF16** | 10.16 | 98.4 | 8.07x | +707% | 3.4 | 38.8 | 3.5 |
+| **Quantization 8-bit** | 10.26 | 97.5 | 7.99x | +699% | 3.5 | 36.3 | 3.5 |
 
 ### Key Performance Metrics
 
 - **Dataset**: 1000 SciPlex2 perturbations (58K genes each)
-- **Model**: Geneformer gf-6L-10M-i2048
+- **Models**: 
+  - Geneformer v1: gf-6L-10M-i2048 (6 layers, 10M parameters)
+  - Geneformer v2: gf-12L-38M-i4096 (12 layers, 38M parameters)
 - **Hardware**: CUDA GPU (80GB total memory)
 - **Embedding Consistency**: >0.9999 cosine similarity (excellent preservation)
+
+*Note: CPU/GPU usage and memory consumption are shown as average values in the tables above. Peak values and detailed resource utilization metrics are available in the individual result files.*
 
 ### Evaluation Results
 
@@ -81,21 +107,13 @@ Based on comprehensive benchmarking with 1000 SciPlex2 perturbations:
 - **Adjusted Rand Index**: 0.067 (clustering agreement with ground truth)
 - **Control Separation Ratio**: 1.33 (control vs perturbation separation)
 
-### Resource Utilization
+### Resource Utilization Insights
 
-**Baseline Performance**:
-- CPU Usage: 3.5% average, 10% peak
-- Memory Usage: 3.7% average (3.5 GB)
-- GPU Usage: 2.1% average, 6% peak
-- GPU Memory: 844 MB average, 845 MB peak
+The optimization techniques significantly improve GPU utilization:
+- **Geneformer v1**: GPU usage increases from 2.1% (baseline) to up to 20.8% (batching bs=64), representing a **10x improvement** in hardware efficiency
+- **Geneformer v2**: GPU usage increases from 6.2% (baseline) to up to 44.4% (batching bs=64), representing a **7x improvement** in hardware efficiency
 
-**Optimized Performance (Batching bs=256)**:
-- CPU Usage: 3.4% average, 3.8% peak
-- Memory Usage: 3.6% average (3.4 GB)
-- GPU Usage: 17.3% average, 23% peak (better utilization!)
-- GPU Memory: 756 MB average, 847 MB peak
-
-The optimizations significantly improve GPU utilization (from 2% to 17%), indicating better hardware efficiency.
+Memory consumption remains relatively stable across all optimization methods, typically using 3.3-3.6 GB of system RAM. CPU usage remains low (3.4-3.7%) across all configurations, indicating that the optimizations primarily benefit from better GPU utilization rather than increased CPU load.
 
 ## 🚀 Quick Start
 
