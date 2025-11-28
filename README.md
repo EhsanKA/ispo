@@ -9,7 +9,7 @@ This repository implements comprehensive optimizations for efficient **In-Silico
 ## 🎯 Challenge Objectives
 
 - **Baseline Establishment**: Create a comprehensive profiling baseline for Geneformer ISP inference
-- **Optimization Implementation**: Apply multiple optimization techniques (batching, mixed precision, ONNX Runtime)
+- **Optimization Implementation**: Apply multiple optimization techniques (batching, mixed precision)
 - **Performance Benchmarking**: Measure improvements in speed, memory usage, and scalability
 - **Result Validation**: Ensure optimizations preserve model accuracy and output consistency
 
@@ -58,7 +58,6 @@ Based on comprehensive benchmarking with 1000 SciPlex2 perturbations:
 | **Baseline** | 74.05 | 13.5 | 1.00x | - |
 | **Batching (bs=256)** | 6.85 | 146.0 | **10.8x** | +981% |
 | **Mixed Precision FP16** | 6.77 | 147.7 | **10.9x** | +994% |
-| **ONNX Runtime** | 12.31 | 81.2 | 6.0x | +502% |
 
 ### Key Performance Metrics
 
@@ -205,19 +204,6 @@ with torch.cuda.amp.autocast():
 - Maintains numerical stability through automatic casting
 
 **Results**: 10.9x speedup (74.05s → 6.77s for 1000 samples)
-
-### 3. ONNX Runtime
-
-**Strategy**: Export model to ONNX format and use ONNX Runtime for inference
-
-**Benefits**:
-- Graph-level optimizations (operator fusion, constant folding)
-- Cross-platform deployment
-- Optimized execution engine
-
-**Results**: 6.0x speedup (74.05s → 12.31s for 1000 samples)
-
-**Note**: ONNX conversion may have some overhead, but provides better deployment flexibility.
 
 ## 📈 Evaluation Methodology
 
