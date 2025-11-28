@@ -1,0 +1,73 @@
+# Configuration for quantization optimization with Geneformer v1 6L model
+# Quantization: 8-bit (INT8)
+
+# Dataset configuration
+dataset:
+  name: "sciplex2"
+  data_path: "data/SrivatsanTrapnell2020_sciplex2.h5ad"
+  download_url: "https://zenodo.org/record/10044268/files/SrivatsanTrapnell2020_sciplex2.h5ad?download=1"
+  num_cells: 1000
+  random_seed: 42
+
+# Model configuration
+model:
+  name: "gf-6L-10M-i2048"  # Geneformer v1 6L model (6 layers, 10M parameters, 2048 input length)
+  version: "v1"
+  device: "auto"  # "auto", "cuda", or "cpu"
+
+# Optimization method configuration
+optimization:
+  method: "quantization"
+  batch_size: 256
+
+# Baseline comparison configuration
+baseline:
+  embeddings_path: "results/baseline/embeddings.npz"  # Path to baseline embeddings for comparison
+  enabled: true  # Enable baseline comparison metrics
+
+# Output configuration
+output:
+  base_dir: "results"
+  output_dir: "results/quantization_8bit"
+  save_embeddings: true
+  save_metadata: true
+  save_metrics: true
+  save_evaluation_metrics: true
+  save_geometry_metrics: true
+  save_baseline_comparison: true
+
+# Wandb configuration
+wandb:
+  enabled: true
+  project: "ispo"
+  run_name: null  # null = auto-generate (will be: quantization_8bit_bs256_gf-6L-10M-i2048_cuda)
+  tags:
+    - "optimized"
+    - "quantization"
+    - "8bit"
+    - "geneformer-v1"
+    - "6L"
+    - "evaluation"
+  log_embeddings: true
+  log_artifacts: true
+
+# Evaluation configuration
+evaluation:
+  zero_shot:
+    test_size: 0.2
+    random_state: 42
+  geometry:
+    k_neighbors: 15
+
+# Inference configuration
+inference:
+  batch_size: 256  # Quantization batch size
+
+# Resource logging
+logging:
+  log_cpu: true
+  log_gpu: true
+  log_memory: true
+  log_temperature: true
+  update_interval: 1.0  # seconds between metric updates
+

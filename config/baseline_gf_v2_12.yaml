@@ -1,0 +1,64 @@
+# Configuration for baseline evaluation with Geneformer v2 12L model
+
+# Dataset configuration
+dataset:
+  name: "sciplex2"
+  data_path: "data/SrivatsanTrapnell2020_sciplex2.h5ad"
+  download_url: "https://zenodo.org/record/10044268/files/SrivatsanTrapnell2020_sciplex2.h5ad?download=1"
+  num_cells: 1000
+  random_seed: 42
+
+# Model configuration
+model:
+  name: "gf-12L-38M-i4096"  # Geneformer v2 12L model (12 layers, 38M parameters, 4096 input length)
+  # Available models in Helical:
+  # - "gf-6L-10M-i2048" (v1 smallest)
+  # - "gf-12L-38M-i4096" (v2 12L - this one)
+  # - "gf-12L-40M-i2048" (v2 12L alternative)
+  # - "gf-12L-104M-i4096" (v2 12L larger)
+  # - "gf-18L-316M-i4096" (v1 large)
+  # - "gf-20L-151M-i4096" (v2 20L)
+  version: "v2"
+  device: "auto"  # "auto", "cuda", or "cpu"
+
+# Output configuration
+output:
+  base_dir: "results"
+  output_dir: "results/baseline_gf_v2_12"
+  save_embeddings: true
+  save_metadata: true
+  save_metrics: true
+
+# Wandb configuration
+wandb:
+  enabled: true
+  project: "ispo"
+  run_name: null  # null = auto-generate
+  tags:
+    - "baseline"
+    - "geneformer-v2"
+    - "12L"
+    - "evaluation"
+  log_embeddings: true
+  log_artifacts: true
+
+# Evaluation configuration
+evaluation:
+  zero_shot:
+    test_size: 0.2
+    random_state: 42
+  geometry:
+    k_neighbors: 15
+
+# Inference configuration
+inference:
+  batch_size: 1  # Baseline batch size
+
+# Resource logging
+logging:
+  log_cpu: true
+  log_gpu: true
+  log_memory: true
+  log_temperature: true
+  update_interval: 1.0  # seconds between metric updates
+

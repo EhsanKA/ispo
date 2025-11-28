@@ -14,6 +14,8 @@ import psutil
 import GPUtil
 from memory_profiler import profile
 import torch
+import torch.nn as nn
+from torch.nn.parallel import DataParallel
 from helical.models.geneformer import Geneformer, GeneformerConfig
 import anndata
 import logging
@@ -32,6 +34,21 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     logger.warning("wandb not available. Install with: pip install wandb")
+
+# Load environment variables from .env file for wandb API key
+try:
+    from dotenv import load_dotenv
+    from pathlib import Path
+    # Try to load .env from project root (assuming this file is in ispo/core/)
+    env_path = Path(__file__).parent.parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        # Try loading from current directory
+        load_dotenv()
+except ImportError:
+    # python-dotenv not installed, continue without it
+    pass
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, f1_score, adjusted_rand_score, normalized_mutual_info_score,
@@ -42,106 +59,16 @@ from sklearn.linear_model import RidgeClassifier
 from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
 
-
-class PerformanceProfiler:
-    """Class to profile CPU, GPU, and memory usage during inference."""
-
-    def __init__(self, use_wandb: bool = False, wandb_run=None):
-        """
-        Initialize profiler.
-        
-        Args:
-            use_wandb: Whether to log to wandb
-            wandb_run: wandb run object for logging
-        """
-        self.start_time = None
-        self.end_time = None
-        self.cpu_usage = []
-        self.memory_usage = []
-        self.gpu_usage = []
-        self.gpu_memory = []
-        self.use_wandb = use_wandb and WANDB_AVAILABLE
-        self.wandb_run = wandb_run
-        self.step = 0
-
-    def start_profiling(self):
-        """Start profiling system resources."""
-        self.start_time = time.time()
-        logger.info("Started performance profiling")
-
-    def update_metrics(self):
-        """Update current resource usage metrics."""
-        # CPU usage
-        cpu_percent = psutil.cpu_percent(interval=None)
-        self.cpu_usage.append(cpu_percent)
-
-        # Memory usage
-        memory = psutil.virtual_memory()
-        memory_percent = memory.percent
-        self.memory_usage.append(memory_percent)
-
-        # GPU usage (if available)
-        gpu_percent = None
-        gpu_mem = None
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu = gpus[0]  # Use first GPU
-                gpu_percent = gpu.load * 100
-                gpu_mem = gpu.memoryUsed
-                self.gpu_usage.append(gpu_percent)
-                self.gpu_memory.append(gpu_mem)
-        except:
-            pass
-        
-        # Log to wandb in real-time
-        if self.use_wandb and self.wandb_run is not None:
-            log_dict = {
-                'runtime/cpu_percent': cpu_percent,
-                'runtime/memory_percent': memory_percent,
-                'runtime/memory_used_gb': memory.used / (1024**3),
-                'runtime/memory_available_gb': memory.available / (1024**3),
-            }
-            if gpu_percent is not None:
-                log_dict['runtime/gpu_percent'] = gpu_percent
-            if gpu_mem is not None:
-                log_dict['runtime/gpu_memory_mb'] = gpu_mem
-                log_dict['runtime/gpu_memory_gb'] = gpu_mem / 1024
-            
-            self.wandb_run.log(log_dict, step=self.step)
-            self.step += 1
-
-    def stop_profiling(self) -> Dict[str, float]:
-        """Stop profiling and return summary statistics."""
-        self.end_time = time.time()
-        total_time = self.end_time - self.start_time
-
-        metrics = {
-            'total_time_seconds': total_time,
-            'avg_cpu_percent': np.mean(self.cpu_usage) if self.cpu_usage else 0,
-            'max_cpu_percent': np.max(self.cpu_usage) if self.cpu_usage else 0,
-            'avg_memory_percent': np.mean(self.memory_usage) if self.memory_usage else 0,
-            'max_memory_percent': np.max(self.memory_usage) if self.memory_usage else 0,
-        }
-
-        if self.gpu_usage:
-            metrics.update({
-                'avg_gpu_percent': np.mean(self.gpu_usage),
-                'max_gpu_percent': np.max(self.gpu_usage),
-                'avg_gpu_memory_mb': np.mean(self.gpu_memory),
-                'max_gpu_memory_mb': np.max(self.gpu_memory),
-            })
-
-        logger.info(f"Performance profiling completed. Total time: {total_time:.2f}s")
-        return metrics
+from .profiler import PerformanceProfiler
 
 
 class GeneformerISPOptimizer:
     """Main class for Geneformer In-Silico Perturbation optimization."""
 
-    def __init__(self, model_name: str = "gf-12L-38M-i4096", device: str = "cuda",
+    def __init__(self, model_name: str = "gf-6L-10M-i2048", device: str = "cuda",
                  use_wandb: bool = False, wandb_project: str = "ispo-baseline",
-                 wandb_run_name: Optional[str] = None, wandb_config: Optional[Dict] = None):
+                 wandb_run_name: Optional[str] = None, wandb_config: Optional[Dict] = None,
+                 num_gpus: Optional[int] = None):
         """
         Initialize the Geneformer ISP optimizer.
 
@@ -152,12 +79,32 @@ class GeneformerISPOptimizer:
             wandb_project: wandb project name
             wandb_run_name: Optional name for the wandb run
             wandb_config: Optional config dictionary for wandb
+            num_gpus: Number of GPUs to use for multi-GPU inference (None = use all available, 1 = single GPU)
         """
         self.model_name = model_name
         self.device = device
         self.model = None
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         self.wandb_run = None
+        
+        # Multi-GPU support
+        if device == "cuda" and torch.cuda.is_available():
+            available_gpus = torch.cuda.device_count()
+            if num_gpus is None:
+                # Use all available GPUs by default
+                self.num_gpus = available_gpus
+            else:
+                # Use specified number, but cap at available
+                self.num_gpus = min(num_gpus, available_gpus)
+            
+            if self.num_gpus > 1:
+                logger.info(f"Multi-GPU mode: Using {self.num_gpus} GPUs")
+                for i in range(self.num_gpus):
+                    logger.info(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+            else:
+                self.num_gpus = 1
+        else:
+            self.num_gpus = 1
         
         # Initialize wandb if requested
         if self.use_wandb:
@@ -192,16 +139,31 @@ class GeneformerISPOptimizer:
             batch_size=1  # Start with batch size 1 for baseline
         )
         self.model = Geneformer(config)
+        
+        # Wrap model with DataParallel for multi-GPU support
+        if self.num_gpus > 1 and torch.cuda.device_count() > 1:
+            logger.info(f"Wrapping model with DataParallel for {self.num_gpus} GPUs")
+            # Access the underlying PyTorch model
+            if hasattr(self.model, 'model'):
+                self.model.model = DataParallel(
+                    self.model.model,
+                    device_ids=list(range(self.num_gpus))
+                )
+                logger.info(f"Model wrapped with DataParallel on GPUs: {list(range(self.num_gpus))}")
+            else:
+                logger.warning("Model does not have 'model' attribute. Multi-GPU may not work correctly.")
+        
         logger.info("Model loaded successfully")
 
     def load_perturbation_data(self, data_path: str = "SrivatsanTrapnell2020_sciplex2.h5ad",
-                              num_perturbations: int = 100) -> anndata.AnnData:
+                              num_cells: int = 1000, dataset: str = "sciplex2") -> anndata.AnnData:
         """
-        Load real perturbation data from SciPlex2 dataset.
+        Load real perturbation data from sciplex2 dataset.
 
         Args:
-            data_path: Path to the SciPlex2 .h5ad file
-            num_perturbations: Number of perturbation samples to use (subset for testing)
+            data_path: Path to the sciplex2 .h5ad file
+            num_cells: Number of cells to select (default: 1000)
+            dataset: Dataset name ('sciplex2')
 
         Returns:
             AnnData object with perturbation data
@@ -209,45 +171,39 @@ class GeneformerISPOptimizer:
         logger.info(f"Loading perturbation data from {data_path}")
 
         if not os.path.exists(data_path):
-            logger.info("Downloading SciPlex2 data...")
+            logger.info("Downloading sciplex2 data...")
             url = "https://zenodo.org/record/10044268/files/SrivatsanTrapnell2020_sciplex2.h5ad?download=1"
             import urllib.request
-            urllib.request.urlretrieve(url, data_path)
+            try:
+                urllib.request.urlretrieve(url, data_path)
+                logger.info(f"Downloaded sciplex2 data to {data_path}")
+            except Exception as e:
+                logger.error(f"Failed to download sciplex2: {e}")
+                logger.error(f"Please download manually from: {url}")
+                raise
 
         # Load the data
         adata = anndata.read_h5ad(data_path)
         logger.info(f"Loaded data with shape: {adata.shape}")
 
-        # Subset to requested number of perturbations (take from different perturbation types)
-        if num_perturbations < len(adata):
-            # Sample evenly from different perturbation types
-            perturbation_types = adata.obs['perturbation'].unique()
-            samples_per_type = num_perturbations // len(perturbation_types)
-            remaining = num_perturbations % len(perturbation_types)
-
-            selected_indices = []
-            for i, pert_type in enumerate(perturbation_types):
-                type_indices = adata.obs[adata.obs['perturbation'] == pert_type].index
-                n_samples = samples_per_type + (1 if i < remaining else 0)
-                if len(type_indices) >= n_samples:
-                    selected = np.random.choice(type_indices, n_samples, replace=False)
-                else:
-                    selected = type_indices
-                selected_indices.extend(selected.tolist())
-
-            # If we still don't have enough, add more from the largest group
-            if len(selected_indices) < num_perturbations:
-                remaining_needed = num_perturbations - len(selected_indices)
-                largest_group = adata.obs['perturbation'].value_counts().index[0]
-                largest_indices = adata.obs[adata.obs['perturbation'] == largest_group].index
-                available_indices = [idx for idx in largest_indices if idx not in selected_indices]
-                additional = np.random.choice(available_indices, min(remaining_needed, len(available_indices)), replace=False)
-                selected_indices.extend(additional.tolist())
-
+        # Subset to requested number of cells
+        if num_cells < len(adata):
+            # Randomly sample cells
+            np.random.seed(42)  # For reproducibility
+            selected_indices = np.random.choice(adata.obs.index, num_cells, replace=False)
             adata = adata[selected_indices]
+            logger.info(f"Selected {num_cells} cells from dataset")
 
-        logger.info(f"Using {len(adata)} perturbations from SciPlex2 dataset")
-        logger.info(f"Perturbation types: {adata.obs['perturbation'].value_counts().to_dict()}")
+        logger.info(f"Using {len(adata)} cells from sciplex2 dataset")
+        if 'perturbation' in adata.obs:
+            perturbation_types = adata.obs['perturbation'].value_counts().to_dict()
+            logger.info(f"Perturbation types: {perturbation_types}")
+        elif 'perturbation_type' in adata.obs:
+            perturbation_types = adata.obs['perturbation_type'].value_counts().to_dict()
+            logger.info(f"Perturbation types: {perturbation_types}")
+        elif 'treatment' in adata.obs:
+            treatment_types = adata.obs['treatment'].value_counts().to_dict()
+            logger.info(f"Treatment types: {treatment_types}")
 
         return adata
 
@@ -490,12 +446,14 @@ class GeneformerISPOptimizer:
         return metrics
 
     def run_baseline_inference(self, adata: anndata.AnnData,
+                             batch_size: int = 1,
                              output_dir: str = "results/baseline") -> Dict:
         """
         Run baseline inference on perturbation data with performance profiling.
 
         Args:
             adata: AnnData object with perturbation data
+            batch_size: Batch size for processing (default: 1)
             output_dir: Directory to save results
 
         Returns:
@@ -503,7 +461,10 @@ class GeneformerISPOptimizer:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        logger.info("Starting baseline inference with profiling")
+        # Scale batch size for multi-GPU (DataParallel splits batches automatically)
+        # With num_gpus GPUs, we can process larger batches efficiently
+        effective_batch_size = batch_size * self.num_gpus if self.num_gpus > 1 else batch_size
+        logger.info(f"Starting baseline inference with profiling (batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size})")
         self.profiler.start_profiling()
 
         # Process data
@@ -512,11 +473,11 @@ class GeneformerISPOptimizer:
 
         # Run inference with periodic profiling updates
         logger.info("Running inference...")
-        batch_size = 10  # Process in small batches to allow profiling
         all_embeddings = []
 
-        for i in range(0, len(dataset), batch_size):
-            batch_end = min(i + batch_size, len(dataset))
+        # Use effective batch size for processing (DataParallel will split across GPUs)
+        for i in range(0, len(dataset), effective_batch_size):
+            batch_end = min(i + effective_batch_size, len(dataset))
             batch_dataset = dataset.select(range(i, batch_end))
 
             # Update profiling metrics
@@ -526,7 +487,7 @@ class GeneformerISPOptimizer:
             batch_embeddings = self.model.get_embeddings(batch_dataset)
             all_embeddings.append(batch_embeddings)
 
-            logger.info(f"Processed batch {i//batch_size + 1}/{(len(dataset)-1)//batch_size + 1}")
+            logger.info(f"Processed batch {i//effective_batch_size + 1}/{(len(dataset)-1)//effective_batch_size + 1}")
 
         # Combine all embeddings
         embeddings = np.vstack(all_embeddings)
