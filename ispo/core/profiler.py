@@ -68,6 +68,17 @@ class PerformanceProfiler:
 
     def start_profiling(self):
         """Start profiling system resources."""
+        # Synchronize GPU operations before timing (if CUDA available)
+        # For DataParallel (multi-GPU), synchronize all devices to ensure accurate timing
+        if torch.cuda.is_available():
+            # Synchronize all devices to handle DataParallel correctly
+            for device_id in range(torch.cuda.device_count()):
+                with torch.cuda.device(device_id):
+                    torch.cuda.synchronize()
+        
+        # Note: We don't use barrier here because profiling might only be called on rank 0
+        # The barrier will be handled in stop_profiling where we synchronize all ranks
+        
         self.start_time = time.time()
         logger.info("Started performance profiling")
 
@@ -175,10 +186,48 @@ class PerformanceProfiler:
             self.wandb_run.log(log_dict, step=self.step)
             self.step += 1
 
-    def stop_profiling(self) -> Dict[str, float]:
-        """Stop profiling and return summary statistics."""
+    def stop_profiling(self, collect_metrics: bool = True) -> Dict[str, float]:
+        """
+        Stop profiling and return summary statistics.
+        
+        Args:
+            collect_metrics: Whether to collect detailed metrics (CPU, GPU, etc.)
+                            Set to False on non-main ranks in DDP to avoid unnecessary work.
+        
+        Returns:
+            Dictionary with performance metrics. On non-main ranks in DDP with collect_metrics=False,
+            returns only total_time_seconds.
+        """
+        # Synchronize GPU operations before timing (if CUDA available)
+        # For DataParallel (multi-GPU), synchronize all devices to ensure accurate timing
+        if torch.cuda.is_available():
+            # Synchronize all devices to handle DataParallel correctly
+            for device_id in range(torch.cuda.device_count()):
+                with torch.cuda.device(device_id):
+                    torch.cuda.synchronize()
+        
         self.end_time = time.time()
-        total_time = self.end_time - self.start_time
+        total_time = self.end_time - self.start_time if self.start_time is not None else 0.0
+        
+        # In DDP, synchronize and get the maximum time across all ranks for accurate measurement
+        # This ensures we measure the time of the slowest process (which determines total time)
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                # First, synchronize all processes to ensure they've all finished
+                dist.barrier()
+                
+                # Get the maximum time across all ranks (slowest rank determines total time)
+                # Use CPU tensor to avoid device placement issues
+                time_tensor = torch.tensor([total_time], dtype=torch.float32)
+                dist.all_reduce(time_tensor, op=dist.ReduceOp.MAX)
+                total_time = time_tensor.item()
+        except (ImportError, RuntimeError):
+            pass
+        
+        # If not collecting detailed metrics (e.g., on non-main ranks in DDP), return early
+        if not collect_metrics:
+            return {'total_time_seconds': total_time}
 
         metrics = {
             'total_time_seconds': total_time,

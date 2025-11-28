@@ -221,8 +221,12 @@ class OptimizedGeneformerISPOptimizer(GeneformerISPOptimizer):
             if is_main_process() or not self.use_ddp:
                 logger.info(f"Starting batching optimized inference with batch_size={batch_size}, num_gpus={self.num_gpus}, effective_batch_size={effective_batch_size}")
         
-        # Only start profiling on main process (or if not using DDP)
-        if is_main_process() or not self.use_ddp:
+        # Start profiling on all ranks for DDP synchronization, but only log on main process
+        if self.use_ddp:
+            self.profiler.start_profiling()
+            if is_main_process():
+                logger.info("Started performance profiling")
+        elif is_main_process() or not self.use_ddp:
             self.profiler.start_profiling()
 
         # Process data
@@ -280,8 +284,11 @@ class OptimizedGeneformerISPOptimizer(GeneformerISPOptimizer):
         else:
             embeddings = np.vstack(all_embeddings)
 
-        # Stop profiling (only on main process or if not using DDP)
-        if is_main_process() or not self.use_ddp:
+        # Stop profiling on all ranks for DDP synchronization (barrier requires all ranks)
+        # Only collect detailed metrics on main process to avoid unnecessary work
+        if self.use_ddp:
+            performance_metrics = self.profiler.stop_profiling(collect_metrics=is_main_process())
+        elif is_main_process() or not self.use_ddp:
             performance_metrics = self.profiler.stop_profiling()
         else:
             performance_metrics = {'total_time_seconds': 0}
