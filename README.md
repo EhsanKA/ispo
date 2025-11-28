@@ -223,6 +223,19 @@ with torch.cuda.amp.autocast():
 
 **Results**: 10.9x speedup (74.05s → 6.77s for 1000 samples)
 
+### 3. Quantization (8-bit)
+
+**Strategy**: Attempt to quantize model weights to 8-bit integers
+
+**Implementation Note**: PyTorch's dynamic quantization only works on CPU. When running on CUDA (as in our benchmarks), the implementation automatically falls back to FP16 mixed precision, which provides similar speed benefits without actual weight quantization.
+
+**Why Memory Usage Doesn't Decrease**:
+- On CUDA, quantization doesn't actually run (falls back to FP16)
+- The memory metric measures total system RAM (3.5 GB), not just model weights
+- Model weights (~40-150 MB) are <5% of total memory; quantizing them would save <100 MB, which is negligible compared to data loading, activations, and Python overhead
+
+**Results**: 11.0x speedup (74.05s → 6.71s for 1000 samples) - Note: This is effectively FP16 mixed precision on CUDA
+
 ## 📈 Evaluation Methodology
 
 The project includes comprehensive evaluation to ensure optimization quality:
